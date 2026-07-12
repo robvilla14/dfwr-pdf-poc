@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DFWR PDF Generator — Proof of Concept</title>
+
+<!-- ============================================================
+     DFWR — pdfmake PROOF OF CONCEPT
+     ------------------------------------------------------------
+     Purpose: validate generating the Daily Field Work Record PDF
+     directly with pdfmake instead of browser printing, so that:
+       - Safari cannot inject its URL/date/page footer
+       - long Work Reports auto-paginate (no continuation sheets)
+       - the company footer repeats on every page (no orphan page)
+     This is a standalone test page. It imports the SAME record
+     export the current tool produces, so your five test files work
+     unchanged. It does not save records or replace the real tool.
+
+     DEPLOY: put these three files in one folder on GitHub Pages:
+       index.html, pdfmake.min.js, vfs_fonts.js
+     They are all local (no CDN), so it works offline once loaded.
+     ============================================================ -->
+
+<!-- Vendored pdfmake (no build step, no CDN, offline-capable) -->
+<script src="pdfmake.min.js"></script>
+<script src="vfs_fonts.js"></script>
+
+<style>
+  :root { --navy:#1B2A47; --slate:#4A5D6D; --mid:#607890; --frost:#C0CEDC; --snow:#E4EAF2; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+         color:#1F2933; margin:0; background:#F5F8FB; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; color: var(--navy); margin: 6px 0 2px; }
+  .sub { color: var(--mid); font-size: 13px; margin: 0 0 18px; }
+  .card { background:#fff; border:1px solid var(--frost); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--slate); margin:0 0 12px; }
+  label { display:block; font-size:12px; font-weight:600; color:var(--slate); margin:10px 0 4px; }
+  input[type=text], select { width:100%; padding:9px 11px; border:1.5px solid var(--frost);
+         border-radius:8px; font-size:14px; font-family:inherit; }
+  input[type=text]:focus, select:focus { outline:none; border-color:var(--navy); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .btn { display:inline-block; background:var(--navy); color:#fff; border:none; border-radius:10px;
+         padding:13px 18px; font-size:15px; font-weight:700; cursor:pointer; width:100%; margin-top:6px; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn.secondary { background:#fff; color:var(--navy); border:1.5px solid var(--frost); }
+  .hint { font-size:12px; color:var(--mid); margin-top:6px; line-height:1.45; }
+  .status { font-size:13px; margin-top:10px; padding:10px 12px; border-radius:8px; display:none; }
+  .status.ok { display:block; background:#EAF6EC; border:1px solid #BFE3C6; color:#1E5A2A; }
+  .status.err { display:block; background:#FBEAEA; border:1px solid #F0C4C4; color:#8A1F1F; }
+  .filerow { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  input[type=file] { font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>DFWR PDF Generator</h1>
+  <p class="sub">Proof of concept — generates the PDF directly with pdfmake (no browser print, no Safari headers).</p>
+
+  <div class="card">
+    <h2>1. Import records</h2>
+    <div class="filerow">
+      <input type="file" id="fileInput" accept="application/json,.json">
+    </div>
+    <label for="recordSelect">Record</label>
+    <select id="recordSelect"><option value="">— import an export file above —</option></select>
+    <p class="hint">Use one of your existing DFWR export files (the same JSON the current tool saves). Every record in it appears here.</p>
+  </div>
+
+  <div class="card">
+    <h2>2. Company info (for the footer)</h2>
+    <div class="grid2">
+      <div><label for="cAddress">Address</label><input type="text" id="cAddress" value="3706 Kilroy Airport Blvd"></div>
+      <div><label for="cCity">City / State / ZIP</label><input type="text" id="cCity" value="Long Beach, CA 90001"></div>
+      <div><label for="cPhone">Phone</label><input type="text" id="cPhone" value="(999) 999-9999"></div>
+      <div><label for="cEmail">Email</label><input type="text" id="cEmail" value="test@test.com"></div>
+    </div>
+    <label for="logoInput">Logo (optional, PNG/JPEG)</label>
+    <input type="file" id="logoInput" accept="image/png,image/jpeg">
+    <p class="hint">These are only used to render the PDF footer/header in this test. Nothing is saved.</p>
+  </div>
+
+  <div class="card">
+    <h2>3. Generate</h2>
+    <button class="btn" id="genBtn" disabled>Generate PDF</button>
+    <button class="btn secondary" id="openBtn" disabled style="margin-top:10px;">Open in new tab (iPad: then Share → Save to Files)</button>
+    <div class="status" id="status"></div>
+    <p class="hint">On desktop, "Generate PDF" downloads the file. On iPad, use "Open in new tab", then tap the Share icon and choose Save to Files — this is the save flow we're validating.</p>
+  </div>
+</div>
+
+<script>
+/* Ensure pdfmake fonts are wired (vfs_fonts.js auto-registers on load). */
+(function ensureVfs(){
+  if (window.pdfMake && !pdfMake.vfs && window.vfs) { try { pdfMake.vfs = window.vfs; } catch(e){} }
+})();
+
+var records = [];
+var currentLogo = null;
+
+/* ---- import export file ---- */
+document.getElementById('fileInput').addEventListener('change', function (e) {
+  var file = e.target.files[0]; if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function () {
+    try {
+      var data = JSON.parse(reader.result);
+      records = Array.isArray(data) ? data : [data];
+      var sel = document.getElementById('recordSelect');
+      sel.innerHTML = '';
+      records.forEach(function (r, i) {
+        var o = document.createElement('option');
+        o.value = String(i);
+        o.textContent = (r.jobName || '(no job name)') + (r.date ? '  —  ' + r.date : '');
+        sel.appendChild(o);
+      });
+      setStatus('ok', 'Loaded ' + records.length + ' record' + (records.length !== 1 ? 's' : '') + '.');
+      updateButtons();
+    } catch (err) {
+      setStatus('err', 'Could not read that file as JSON: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+});
+
+/* ---- logo upload -> data URI ---- */
+document.getElementById('logoInput').addEventListener('change', function (e) {
+  var file = e.target.files[0]; if (!file) { currentLogo = null; return; }
+  var reader = new FileReader();
+  reader.onload = function () { currentLogo = reader.result; };
+  reader.readAsDataURL(file);
+});
+
+document.getElementById('recordSelect').addEventListener('change', updateButtons);
+function updateButtons() {
+  var has = document.getElementById('recordSelect').value !== '' && records.length > 0;
+  document.getElementById('genBtn').disabled = !has;
+  document.getElementById('openBtn').disabled = !has;
+}
+
+function currentSetup() {
+  return {
+    primary: '#1B2A47',
+    address: document.getElementById('cAddress').value.trim(),
+    cityState: document.getElementById('cCity').value.trim(),
+    phone: document.getElementById('cPhone').value.trim(),
+    email: document.getElementById('cEmail').value.trim(),
+    logo: currentLogo
+  };
+}
+function currentRecord() {
+  var i = parseInt(document.getElementById('recordSelect').value, 10);
+  return records[i];
+}
+function setStatus(kind, msg) {
+  var el = document.getElementById('status');
+  el.className = 'status ' + kind; el.textContent = msg;
+}
+
+/* ---- generate (desktop download) ---- */
+document.getElementById('genBtn').addEventListener('click', function () {
+  try {
+    var r = currentRecord();
+    var dd = buildDocDefinition(r, currentSetup());
+    pdfMake.createPdf(dd).download(buildFilename(r) + '.pdf');
+    setStatus('ok', 'PDF generated. Check your downloads.');
+  } catch (err) { setStatus('err', 'Generate failed: ' + err.message); }
+});
+
+/* ---- open in new tab (iPad save flow) ---- */
+document.getElementById('openBtn').addEventListener('click', function () {
+  try {
+    var r = currentRecord();
+    var dd = buildDocDefinition(r, currentSetup());
+    // .open() must run inside this click (user gesture) for iOS Safari.
+    pdfMake.createPdf(dd).open();
+    setStatus('ok', 'Opened the PDF in a new tab. On iPad: Share icon → Save to Files.');
+  } catch (err) { setStatus('err', 'Open failed: ' + err.message); }
+});
+
+/* ============================================================
+   buildDocDefinition + buildFilename
+   (identical to the shared module validated in Node)
+   ============================================================ */
+</script>
+<script src="build-doc.js"></script>
+</body>
+</html>
